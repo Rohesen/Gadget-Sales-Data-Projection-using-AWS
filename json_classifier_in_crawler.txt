@@ -1,0 +1,1 @@
+$.orderid,$.product_name,$.quantity,$.price,$.cdc_event_type,$.creation_datetime
