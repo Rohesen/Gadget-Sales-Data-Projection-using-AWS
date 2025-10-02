@@ -1,30 +1,31 @@
-# 📊 Gadget Sales Data Projection using DynamoDB CDC Events
-
-![AWS](https://img.shields.io/badge/AWS-DynamoDB-orange?logo=amazon-aws)
-![Python](https://img.shields.io/badge/Python-3.9-blue?logo=python)
-![Status](https://img.shields.io/badge/Status-Completed-brightgreen)
-
----
+# 📊 Project 1: Gadget Sales Data Projection using DynamoDB and Kinesis
 
 ## 🚀 Project Overview
 
-This project demonstrates a **real-time Change Data Capture (CDC) pipeline** for analyzing gadget sales data.
-It captures data changes from **DynamoDB**, streams them through **EventBridge Pipe → Kinesis Firehose → Lambda**, stores transformed data in **S3**, and makes it queryable via **AWS Glue + Athena**.
+This project demonstrates a **Change Data Capture (CDC) pipeline** for sales data analysis using **AWS services**.
+The pipeline continuously captures order data changes from **DynamoDB**, streams them through **EventBridge Pipe → Kinesis Firehose → Lambda**, stores transformed data in **S3**, and makes it queryable in **Athena** using **AWS Glue Catalog**.
 
 ---
 
 ## ⚙️ Architecture
 
-```mermaid
-flowchart LR
-    A[Mock Data Generator (Python)] --> B[DynamoDB OrdersRawTable]
-    B --> C[EventBridge Pipe]
-    C --> D[Kinesis Firehose]
-    D --> E[Lambda Transformation Layer]
-    E --> F[S3 Bucket]
-    F --> G[Glue Crawler + Data Catalog]
-    G --> H[Athena Queries]
-```
+The pipeline flow is as follows:
+
+1. **Mock Data Generation**: A Python script continuously generates random order data and inserts it into DynamoDB (`OrdersRawTable`).
+2. **DynamoDB**: Acts as the source of truth, holding sales order data.
+3. **EventBridge Pipe**: Captures changes in DynamoDB (CDC).
+4. **Kinesis Firehose**: Consumes the data stream from EventBridge Pipe.
+5. **Lambda Transformation Layer**:
+
+   * Decodes Kinesis data.
+   * Transforms and enriches records with CDC metadata.
+   * Encodes the transformed data and forwards it to Firehose.
+6. **S3 Bucket (`kinesis-firehose-destination-rohes`)**: Stores transformed records as JSON files.
+7. **Glue Crawler**:
+
+   * Classifies JSON schema (`$.orderid, $.product_name, $.quantity, $.price, $.cdc_event_type, $.creation_datetime`).
+   * Creates/updates the table inside `glue_sales_db`.
+8. **Athena**: Queries and analyzes the data stored in S3.
 
 ---
 
@@ -32,53 +33,100 @@ flowchart LR
 
 ```
 📦 gadget-sales-cdc-pipeline
- ┣ 📜 mock_data_generator_for_dynamodb.py   # Python script to generate mock data
- ┣ 📜 transformation_layer_with_lambda.py   # Lambda transformation function
- ┣ 📂 screenshots/                          # Athena + S3 screenshots
- ┣ 📜 README.md                             # Documentation
+ ┣ 📜 mock_data_generator_for_dynamodb.py   # Script to generate mock order data
+ ┣ 📜 transformation_layer_with_lambda.py   # Lambda function for Firehose transformation
+ ┣ 📂 screenshots/                          # Screenshots of S3 and Athena queries
+ ┣ 📜 README.md                             # Project documentation
 ```
 
 ---
 
-## 📝 Setup Instructions
+## 📝 Python Scripts
 
-### 1️⃣ Prerequisites
+### 🔹 1. Mock Data Generator (`mock_data_generator_for_dynamodb.py`)
 
-* AWS Account with DynamoDB, EventBridge, Kinesis, Lambda, S3, Glue, Athena access.
-* Python 3.9+ installed with `boto3`.
+Continuously generates sales order data and pushes into DynamoDB.
 
-### 2️⃣ Clone Repository
+```python
+import boto3
+import random
+import time
+from decimal import Decimal
 
-```bash
-git clone https://github.com/Rohesen/gadget-sales-cdc-pipeline.git
-cd gadget-sales-cdc-pipeline
+session = boto3.Session(profile_name='default', region_name='ap-south-1')
+dynamodb = session.resource('dynamodb')
+table = dynamodb.Table('OrdersRawTable')
+
+def generate_order_data():
+    orderid = str(random.randint(1, 10000))
+    product_name = random.choice(['Laptop', 'Phone', 'Tablet', 'Headphones', 'Charger'])
+    quantity = random.randint(1, 5)
+    price = Decimal(str(round(random.uniform(10.0, 500.0), 2)))
+    return {'orderid': orderid, 'product_name': product_name, 'quantity': quantity, 'price': price}
+
+def insert_into_dynamodb(data):
+    table.put_item(Item=data)
+    print(f"Inserted data: {data}")
+
+if __name__ == '__main__':
+    try:
+        while True:
+            data = generate_order_data()
+            insert_into_dynamodb(data)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nScript stopped manually!")
 ```
 
-### 3️⃣ Configure AWS CLI
+---
 
-```bash
-aws configure
+### 🔹 2. Lambda Transformation Layer (`transformation_layer_with_lambda.py`)
+
+Transforms and enriches raw DynamoDB CDC records before storing them in S3.
+
+```python
+import base64
+import json
+from datetime import datetime
+
+def lambda_handler(event, context):
+    output_records = []
+    for record in event['records']:
+        try:
+            payload = base64.b64decode(record['data'])
+            payload_json = json.loads(payload)
+            event_name = payload_json['eventName']
+            approx_creation_datetime = payload_json['dynamodb']['ApproximateCreationDateTime']
+            creation_datetime = datetime.utcfromtimestamp(approx_creation_datetime).isoformat() + 'Z'
+            new_image = payload_json['dynamodb']['NewImage']
+
+            transformed_data = {
+                'orderid': new_image['orderid']['S'],
+                'product_name': new_image['product_name']['S'],
+                'quantity': int(new_image['quantity']['N']),
+                'price': float(new_image['price']['N']),
+                'cdc_event_type': event_name,
+                'creation_datetime': creation_datetime
+            }
+
+            transformed_data_encoded = base64.b64encode((json.dumps(transformed_data) + '\n').encode('utf-8')).decode('utf-8')
+
+            output_records.append({'recordId': record['recordId'], 'result': 'Ok', 'data': transformed_data_encoded})
+        except Exception:
+            output_records.append({'recordId': record['recordId'], 'result': 'ProcessingFailed', 'data': record['data']})
+    return {'records': output_records}
 ```
 
-### 4️⃣ Run Mock Data Generator
+---
 
-This script continuously inserts random order data into DynamoDB.
+## 🛢️ Data Flow Verification
 
-```bash
-python mock_data_generator_for_dynamodb.py
-```
+* **S3 Bucket** stores JSON files from Firehose:
+  `firehose-kinesis-s3-nrt-batch-...`
 
-### 5️⃣ Lambda Transformation
+* **Glue Catalog Table** (`glue_sales_db.kinesis_firehose_destination_rohes`) created by crawler.
 
-Deploy `transformation_layer_with_lambda.py` as a Lambda function.
-Attach it to **Kinesis Firehose** as a transformation step.
-
-### 6️⃣ S3 + Glue
-
-* Firehose delivers transformed data to S3 bucket: `kinesis-firehose-destination-rohes`.
-* Glue Crawler scans S3 and creates a table in `glue_sales_db`.
-
-### 7️⃣ Query with Athena
+* **Athena Query Example**:
 
 ```sql
 SELECT * 
@@ -86,49 +134,48 @@ FROM kinesis_firehose_destination_rohes
 LIMIT 10;
 ```
 
+✅ Query results show **orderid, product_name, quantity, price, cdc_event_type, creation_datetime**.
+
 ---
 
 ## 📸 Screenshots
 
-* Athena Query Results
-* S3 Bucket JSON Files
+* **Athena Query Results**
+* **S3 Bucket JSON Output**
 
-(See `/screenshots/` folder)
+(Screenshots included in `/screenshots/`)
 
 ---
 
 ## 🧑‍💻 Tech Stack
 
-* **AWS DynamoDB** – CDC Source
-* **AWS EventBridge Pipe** – CDC Event Trigger
-* **AWS Kinesis Firehose** – Stream Delivery
-* **AWS Lambda** – Data Transformation
-* **AWS S3** – Storage Layer
-* **AWS Glue** – Data Catalog & Schema
-* **AWS Athena** – Serverless Query Engine
-* **Python** – Data Generation & Lambda
+* **AWS DynamoDB** (CDC Source)
+* **AWS EventBridge Pipe**
+* **AWS Kinesis Firehose**
+* **AWS Lambda**
+* **AWS S3**
+* **AWS Glue (Crawler + Data Catalog)**
+* **AWS Athena**
+* **Python (Mock Data + Lambda Transformation)**
 
 ---
 
 ## 🎯 Key Learnings
 
-* Streaming real-time CDC events from DynamoDB.
-* Using Lambda to transform streaming data.
-* Querying S3-based datasets with Athena.
-* Automating schema creation with Glue Crawler.
+* How to capture **DynamoDB CDC events** in real-time.
+* Transforming streaming data with **Lambda**.
+* Using **Glue + Athena** for serverless analytics.
+* End-to-end **data pipeline automation** with AWS services.
 
 ---
 
-## 📌 Future Improvements
+## 📌 Next Steps
 
-* Add dashboards in **Amazon QuickSight** or **Grafana**.
-* Support CDC for `UPDATE` and `DELETE` events.
-* Implement **partitioned storage** for faster Athena queries.
+* Add visualization using **Amazon QuickSight** or **Grafana**.
+* Enhance schema with **partitioning** for optimized Athena queries.
+* Extend CDC pipeline for **UPDATE** and **DELETE** event analysis.
 
 ---
 
-## 👤 Author
-
-**Rohesen**
-📅 October 2025
-🔗 [GitHub Profile](https://github.com/Rohesen)
+🔗 **Author:** [Your Name]
+📅 **Date:** October 2025
