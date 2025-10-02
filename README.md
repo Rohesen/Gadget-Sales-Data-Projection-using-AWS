@@ -27,7 +27,7 @@ The pipeline flow is as follows:
    * Creates/updates the table inside `glue_sales_db`.
 8. **Athena**: Queries and analyzes the data stored in S3.
 
-   ![architecture](architecture.png)
+   ![architecture](architecture.jpg)
 ---
 
 ## 📂 Project Structure
